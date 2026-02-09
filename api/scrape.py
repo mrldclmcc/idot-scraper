@@ -1,12 +1,8 @@
 """
-IDOT Bid Letting Scraper - Serverless Function
-This is the backend that runs on Vercel's servers and does all the actual web scraping.
-When the frontend sends a request with an IDOT repository URL, this function fetches that page,
-parses the HTML table, filters for relevant counties and statuses, extracts individual contract URLs,
-scrapes each contract for bidder data, and returns a CSV file.
+IDOT Bid Letting Scraper - Serverless Function (Vercel-compatible version)
+This version uses Vercel's native request/response format instead of BaseHTTPRequestHandler
 """
 
-from http.server import BaseHTTPRequestHandler
 import json
 import urllib.request
 import urllib.error
@@ -27,9 +23,8 @@ VALID_STATUSES = {'active', 'executed', 'awarded'}
 
 class SimpleHTMLParser(HTMLParser):
     """
-    A minimal HTML parser that extracts data from IDOT pages without needing BeautifulSoup.
-    This is necessary because serverless environments have limited dependencies.
-    We're looking for tables and specific data patterns in the HTML structure.
+    A minimal HTML parser that extracts tables and links from IDOT pages.
+    This works without external dependencies like BeautifulSoup.
     """
     def __init__(self):
         super().__init__()
@@ -53,7 +48,6 @@ class SimpleHTMLParser(HTMLParser):
             self.in_cell = True
             self.current_cell = ''
         elif tag == 'a' and self.in_cell:
-            # Extract href links from table cells
             for attr_name, attr_value in attrs:
                 if attr_name == 'href':
                     self.links.append(attr_value)
@@ -77,11 +71,7 @@ class SimpleHTMLParser(HTMLParser):
 
 
 def fetch_url(url):
-    """
-    Fetch a URL and return its HTML content.
-    We're running this on a server, so there are no CORS restrictions.
-    We add a user agent to be polite to the IDOT servers.
-    """
+    """Fetch a URL and return its HTML content"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
@@ -90,73 +80,47 @@ def fetch_url(url):
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             return response.read().decode('utf-8')
-    except urllib.error.HTTPError as e:
-        raise Exception(f"HTTP Error {e.code}: {e.reason}")
-    except urllib.error.URLError as e:
-        raise Exception(f"URL Error: {e.reason}")
     except Exception as e:
-        raise Exception(f"Fetch Error: {str(e)}")
+        raise Exception(f"Failed to fetch {url}: {str(e)}")
 
 
 def parse_repository_page(html_content, base_url):
-    """
-    Parse the IDOT repository page to extract contract URLs.
-    The repository page contains a table with multiple contracts.
-    We need to filter by county and status, then extract the detail page URLs.
-    
-    Returns a list of dictionaries with contract information.
-    """
+    """Extract contract URLs from the repository page that match our filter criteria"""
     parser = SimpleHTMLParser()
     parser.feed(html_content)
     
-    contracts = []
-    
-    # IDOT pages typically have the main data table as the largest table
-    # We'll look through all tables to find rows that match our criteria
-    for table in parser.tables:
-        for row in table:
-            if len(row) < 3:  # Skip header rows or incomplete rows
-                continue
-            
-            # Look for county and status in the row
-            row_text = ' '.join(row).lower()
-            
-            # Check if any valid county is mentioned
-            has_valid_county = any(county in row_text for county in VALID_COUNTIES)
-            
-            # Check if any valid status is mentioned
-            has_valid_status = any(status in row_text for status in VALID_STATUSES)
-            
-            if has_valid_county and has_valid_status:
-                # This row matches our criteria - it should contain a link to the contract detail page
-                # We need to find the contract number or link in this row
-                for cell in row:
-                    # Look for contract detail links (they typically contain "LbContractDetail")
-                    if 'contract' in cell.lower() or any(char.isdigit() for char in cell):
-                        contracts.append({
-                            'row_data': row,
-                            'county': next((c for c in VALID_COUNTIES if c in row_text), 'unknown'),
-                            'status': next((s for s in VALID_STATUSES if s in row_text), 'unknown')
-                        })
-                        break
-    
-    # Now we need to extract the actual URLs from the links found in the page
-    # IDOT contract detail pages follow a pattern like: .../LbContractDetail/...
+    # Find contract detail URLs that contain "LbContractDetail"
     contract_urls = []
     for link in parser.links:
         if 'LbContractDetail' in link:
             full_url = urljoin(base_url, link)
-            contract_urls.append(full_url)
+            if full_url not in contract_urls:
+                contract_urls.append(full_url)
     
-    return contract_urls
+    # Filter based on county and status by checking the table content
+    filtered_urls = []
+    for table in parser.tables:
+        for row in table:
+            if len(row) < 3:
+                continue
+            
+            row_text = ' '.join(row).lower()
+            has_valid_county = any(county in row_text for county in VALID_COUNTIES)
+            has_valid_status = any(status in row_text for status in VALID_STATUSES)
+            
+            if has_valid_county and has_valid_status:
+                # This row matches - find corresponding URL
+                # We'll match URLs in order they appear
+                if contract_urls:
+                    url = contract_urls.pop(0)
+                    if url not in filtered_urls:
+                        filtered_urls.append(url)
+    
+    return filtered_urls
 
 
 def scrape_contract_detail(html_content):
-    """
-    Extract low bidder and awardee information from a contract detail page.
-    These pages contain tables with contractor names and bid amounts.
-    We're looking for the "Low Bidder" row and extracting the company name and price.
-    """
+    """Extract bidder information from a contract detail page"""
     parser = SimpleHTMLParser()
     parser.feed(html_content)
     
@@ -164,23 +128,17 @@ def scrape_contract_detail(html_content):
     low_bid_amount = ''
     awardee = ''
     
-    # Search through all tables for bidder information
     for table in parser.tables:
         for i, row in enumerate(table):
             row_text = ' '.join(row).lower()
             
-            # Look for "low bidder" or similar patterns
             if 'low bid' in row_text or 'lowest bid' in row_text:
-                # The bidder name is usually in the next cell or next row
                 for cell in row:
-                    # Look for dollar amounts (bid amount)
                     if '$' in cell:
                         low_bid_amount = cell.strip()
-                    # Look for company names (usually contain "Inc", "LLC", "Corp", or are longer text)
                     elif len(cell) > 10 and not cell.replace('.', '').replace(',', '').replace('$', '').replace(' ', '').isdigit():
                         low_bidder = cell.strip()
                 
-                # Sometimes the data is in the next row
                 if i + 1 < len(table):
                     next_row = table[i + 1]
                     for cell in next_row:
@@ -189,7 +147,6 @@ def scrape_contract_detail(html_content):
                         elif len(cell) > 10 and not low_bidder:
                             low_bidder = cell.strip()
             
-            # Look for awardee information
             if 'award' in row_text and 'awardee' in row_text:
                 for cell in row:
                     if len(cell) > 10 and not cell.replace('.', '').replace(',', '').replace('$', '').replace(' ', '').isdigit():
@@ -203,34 +160,20 @@ def scrape_contract_detail(html_content):
 
 
 def process_repository(repo_url):
-    """
-    Main processing function that orchestrates the entire scraping workflow.
-    
-    Steps:
-    1. Fetch the repository page (the table of contracts)
-    2. Parse it and extract individual contract URLs that match our filters
-    3. Fetch each contract detail page
-    4. Extract bidder information from each page
-    5. Compile everything into CSV format
-    
-    Returns a CSV string ready for download.
-    """
+    """Main processing function that orchestrates the scraping workflow"""
     results = []
     
-    # Step 1: Fetch the repository page
-    try:
-        html = fetch_url(repo_url)
-    except Exception as e:
-        raise Exception(f"Failed to fetch repository page: {str(e)}")
+    # Fetch the repository page
+    html = fetch_url(repo_url)
     
-    # Step 2: Extract contract URLs from the repository page
+    # Extract contract URLs
     contract_urls = parse_repository_page(html, repo_url)
     
     if not contract_urls:
-        raise Exception("No matching contracts found. Please check the URL and filter criteria.")
+        raise Exception("No matching contracts found. Check the URL and filter criteria.")
     
-    # Step 3 & 4: Fetch and scrape each contract detail page
-    for idx, contract_url in enumerate(contract_urls, 1):
+    # Scrape each contract
+    for contract_url in contract_urls:
         try:
             contract_html = fetch_url(contract_url)
             data = scrape_contract_detail(contract_html)
@@ -242,7 +185,6 @@ def process_repository(repo_url):
                 'awardee': data['awardee']
             })
         except Exception as e:
-            # If a specific contract fails, record the error but continue with others
             results.append({
                 'contract_url': contract_url,
                 'low_bidder': f'ERROR: {str(e)}',
@@ -250,7 +192,7 @@ def process_repository(repo_url):
                 'awardee': ''
             })
     
-    # Step 5: Convert results to CSV format
+    # Convert to CSV
     output = StringIO()
     writer = csv.DictWriter(output, fieldnames=['contract_url', 'low_bidder', 'low_bid_amount', 'awardee'])
     writer.writeheader()
@@ -259,57 +201,82 @@ def process_repository(repo_url):
     return output.getvalue()
 
 
-class handler(BaseHTTPRequestHandler):
+# This is the Vercel serverless function entry point
+# Vercel expects a function that takes (request) and returns a response
+def handler(request):
     """
-    This is the entry point for Vercel serverless functions.
-    When a request comes in from the frontend, this handler processes it.
+    Vercel serverless function handler.
+    This function is called when a request comes to /api/scrape
     """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type'
+            },
+            'body': ''
+        }
     
-    def do_POST(self):
-        """Handle POST requests from the frontend"""
+    # Only accept POST requests
+    if request.method != 'POST':
+        return {
+            'statusCode': 405,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({'error': 'Method not allowed'})
+        }
+    
+    try:
+        # Parse the request body
+        if hasattr(request, 'body'):
+            body = request.body
+            if isinstance(body, bytes):
+                body = body.decode('utf-8')
+            data = json.loads(body)
+        else:
+            data = request.json if hasattr(request, 'json') else {}
         
-        # Set CORS headers so the browser allows our frontend to call this function
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+        repo_url = data.get('repo_url', '').strip()
         
-        try:
-            # Read the request body (which contains the repository URL)
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
-            
-            repo_url = data.get('repo_url', '').strip()
-            
-            if not repo_url:
-                self.wfile.write(json.dumps({
-                    'error': 'No repository URL provided'
-                }).encode())
-                return
-            
-            # Process the repository and generate CSV
-            csv_content = process_repository(repo_url)
-            
-            # Return the CSV data to the frontend
-            self.wfile.write(json.dumps({
+        if not repo_url:
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'error': 'No repository URL provided'})
+            }
+        
+        # Process the repository
+        csv_content = process_repository(repo_url)
+        
+        # Return success response
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
                 'success': True,
                 'csv': csv_content,
                 'message': f'Successfully scraped {csv_content.count(chr(10)) - 1} contracts'
-            }).encode())
-            
-        except Exception as e:
-            # If anything goes wrong, send the error back to the frontend
-            self.wfile.write(json.dumps({
-                'error': str(e)
-            }).encode())
-    
-    def do_OPTIONS(self):
-        """Handle OPTIONS requests for CORS preflight"""
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+            })
+        }
+        
+    except Exception as e:
+        # Return error response
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({'error': str(e)})
+        }
