@@ -1,0 +1,4 @@
+# Python dependencies for the IDOT scraper
+# We're intentionally using only Python's standard library to avoid
+# dependency issues in the serverless environment
+# This file is required by Vercel even if empty
